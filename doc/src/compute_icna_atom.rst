@@ -1,7 +1,7 @@
 .. index:: compute icna/atom
 
 compute icna/atom command
-========================
+=========================
 
 Syntax
 """"""
@@ -28,7 +28,10 @@ Description
 Define a computation that calculates the i-CNA (Interval Common Neighbor
 Analysis) pattern for each atom in the group.  In solid-state systems
 the i-CNA pattern is a useful measure of the local crystal structure
-around an atom.  The i-CNA methodology is described in :ref:`(Faken) <Faken>`.
+around an atom.  The i-CNA method is a parameter-free adaptation of the
+:doc:`conventional CNA method <compute_cna_atom>`; it determines a per-atom
+cutoff by exhaustive analysis of the coordination intervals. The method is
+described in :ref:`(Larsen) <Larsen>`.
 
 Currently, there are five kinds of i-CNA patterns LAMMPS recognizes:
 
@@ -65,6 +68,8 @@ Restrictions
 Related commands
 """"""""""""""""
 
+:doc:`compute cna/atom <compute_cna_atom>`
+
 :doc:`compute centro/atom <compute_centro_atom>`
 
 **Default:** none
@@ -73,8 +78,8 @@ Related commands
 ----------
 
 
-.. _Faken:
+.. _LarsenICNA:
 
 
 
-**(Faken)** Faken, Jonsson, Comput Mater Sci, 2, 279 (1994).
+**(Larsen)** PM Larsen, XXX, XXX, XXX (2020).
