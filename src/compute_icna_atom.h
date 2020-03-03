@@ -13,21 +13,21 @@
 
 #ifdef COMPUTE_CLASS
 
-ComputeStyle(cna/atom,ComputeCNAAtom)
+ComputeStyle(icna/atom,ComputeICNAAtom)
 
 #else
 
-#ifndef LMP_COMPUTE_CNA_ATOM_H
-#define LMP_COMPUTE_CNA_ATOM_H
+#ifndef LMP_COMPUTE_ICNA_ATOM_H
+#define LMP_COMPUTE_ICNA_ATOM_H
 
 #include "compute.h"
 
 namespace LAMMPS_NS {
 
-class ComputeCNAAtom : public Compute {
+class ComputeICNAAtom : public Compute {
  public:
-  ComputeCNAAtom(class LAMMPS *, int, char **);
-  ~ComputeCNAAtom();
+  ComputeICNAAtom(class LAMMPS *, int, char **);
+  ~ComputeICNAAtom();
   void init();
   void init_list(int, class NeighList *);
   void compute_peratom();
@@ -35,10 +35,7 @@ class ComputeCNAAtom : public Compute {
 
  private:
   int nmax;
-  double cutsq;
   class NeighList *list;
-  int **nearest;
-  int *nnearest;
   double *pattern;
 };
 
@@ -55,31 +52,7 @@ Self-explanatory.  Check the input script syntax and compare to the
 documentation for the command.  You can use -echo screen as a
 command-line option when running LAMMPS to see the offending line.
 
-E: Compute cna/atom requires a pair style be defined
+W: More than one compute icna/atom defined
 
-Self-explanatory.
-
-E: Compute cna/atom cutoff is longer than pairwise cutoff
-
-Self-explanatory.
-
-W: Compute cna/atom cutoff may be too large to find ghost atom neighbors
-
-The neighbor cutoff used may not encompass enough ghost atoms
-to perform this operation correctly.
-
-W: More than one compute cna/atom defined
-
-It is not efficient to use compute cna/atom  more than once.
-
-W: Too many neighbors in CNA for %d atoms
-
-More than the maximum # of neighbors was found multiple times.  This
-was unexpected.
-
-W: Too many common neighbors in CNA %d times
-
-More than the maximum # of neighbors was found multiple times.  This
-was unexpected.
-
+It is not efficient to use compute icna/atom  more than once.
 */

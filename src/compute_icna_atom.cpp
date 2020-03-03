@@ -16,13 +16,17 @@
 ------------------------------------------------------------------------- */
 
 #include "compute_icna_atom.h"
+#include "citeme.h"
 #include <mpi.h>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
+#include <cassert>
 #include "atom.h"
 #include "update.h"
-#include "force.h"
-#include "pair.h"
 #include "modify.h"
 #include "neighbor.h"
 #include "neigh_list.h"
@@ -33,27 +37,35 @@
 
 using namespace LAMMPS_NS;
 
-#define MAXNEAR 16
-#define MAXCOMMON 8
+static const char cite_user_ptm_package[] =
+    "i-CNA package:\n\n"
+    "@Article{larsen2020revisiting,\n"
+    " author={Larsen, Peter Mahler},\n"
+    " title={Revisiting the Common Neighbour Analysis and the Centrosymmetry Parameter},\n"
+    " journal={Modelling~Simul.~Mater.~Sci.~Eng.},\n"
+    " year={2020},\n"
+    " number={XXX},\n"
+    " volume={XXX},\n"
+    " pages={XXX},\n"
+    " DOI = {XXX}"
+    "}\n\n";
+
 
 enum{UNKNOWN,FCC,HCP,BCC,ICOS,OTHER};
-enum{NCOMMON,NBOND,MAXBOND,MINBOND};
+
+#define MAX_NEIGHBORS 14
 
 /* ---------------------------------------------------------------------- */
 
 ComputeICNAAtom::ComputeICNAAtom(LAMMPS *lmp, int narg, char **arg) :
   Compute(lmp, narg, arg),
-  list(NULL), nearest(NULL), nnearest(NULL), pattern(NULL)
+  list(NULL), pattern(NULL)
 {
-  if (narg != 4) error->all(FLERR,"Illegal compute icna/atom command");
+  if (narg != 3)
+    error->all(FLERR,"Illegal compute icna/atom command");
 
   peratom_flag = 1;
   size_peratom_cols = 0;
-
-  double cutoff = force->numeric(FLERR,arg[3]);
-  if (cutoff < 0.0) error->all(FLERR,"Illegal compute icna/atom command");
-  cutsq = cutoff*cutoff;
-
   nmax = 0;
 }
 
@@ -61,8 +73,6 @@ ComputeICNAAtom::ComputeICNAAtom(LAMMPS *lmp, int narg, char **arg) :
 
 ComputeICNAAtom::~ComputeICNAAtom()
 {
-  memory->destroy(nearest);
-  memory->destroy(nnearest);
   memory->destroy(pattern);
 }
 
@@ -70,18 +80,6 @@ ComputeICNAAtom::~ComputeICNAAtom()
 
 void ComputeICNAAtom::init()
 {
-  if (force->pair == NULL)
-    error->all(FLERR,"Compute icna/atom requires a pair style be defined");
-  if (sqrt(cutsq) > force->pair->cutforce)
-    error->all(FLERR,"Compute icna/atom cutoff is longer than pairwise cutoff");
-
-  // cannot use neighbor->cutneighmax b/c neighbor has not yet been init
-
-  if (2.0*sqrt(cutsq) > force->pair->cutforce + neighbor->skin &&
-      comm->me == 0)
-    error->warning(FLERR,"Compute icna/atom cutoff may be too large to find "
-                   "ghost atom neighbors");
-
   int count = 0;
   for (int i = 0; i < modify->ncompute; i++)
     if (strcmp(modify->compute[i]->style,"icna/atom") == 0) count++;
@@ -107,29 +105,213 @@ void ComputeICNAAtom::init_list(int /*id*/, NeighList *ptr)
 
 /* ---------------------------------------------------------------------- */
 
-static int get_neighbors(void* list, int atom_index, double (*nbrs)[3])
+/// Pair of neighbor atoms that form a bond (bit-wise storage).
+typedef unsigned int CNAPairBond;
+
+/**
+ * A bit-flag array indicating which pairs of neighbors are bonded
+ * and which are not.
+ */
+struct NeighborBondArray
 {
-  int i = list->ilist[atom_index];
-  int jlist = list->firstneigh[i];
-  int num_available = list->numneigh[i];
+	/// Two-dimensional bit array that stores the bonds between neighbors.
+	unsigned int neighborArray[32];
 
-  double sizes[
+	/// Resets all bits.
+	NeighborBondArray() {
+		memset(neighborArray, 0, sizeof(neighborArray));
+	}
 
-  int n = 0;
-  for (int jj=0;jj<num_available;jj++) {
-    int j = jlist[jj];
-    if (mask[j] & groupbit) {
-        j &= NEIGHMASK;
+	/// Returns whether two nearest neighbors have a bond between them.
+	inline bool neighborBond(int neighborIndex1, int neighborIndex2) const {
+		assert(neighborIndex1 < 32);
+		assert(neighborIndex2 < 32);
+		return (neighborArray[neighborIndex1] & (1<<neighborIndex2));
+	}
 
-        double dx = x[i][0] - x[j][0];
-        double dy = x[i][1] - x[j][1];
-        double dz = x[i][2] - x[j][2];
-        double rsq = dx * dx + dy * dy + dz * dz;
-        n++;
-    }
-  }
+	/// Sets whether two nearest neighbors have a bond between them.
+	inline void setNeighborBond(int neighborIndex1, int neighborIndex2, bool bonded) {
+		assert(neighborIndex1 < 32);
+		assert(neighborIndex2 < 32);
+		if(bonded) {
+			neighborArray[neighborIndex1] |= (1<<neighborIndex2);
+			neighborArray[neighborIndex2] |= (1<<neighborIndex1);
+		}
+		else {
+			neighborArray[neighborIndex1] &= ~(1<<neighborIndex2);
+			neighborArray[neighborIndex2] &= ~(1<<neighborIndex1);
+		}
+	}
+};
 
-  return num_found;
+
+/******************************************************************************
+* Find all atoms that are nearest neighbors of the given pair of atoms.
+******************************************************************************/
+int findCommonNeighbors(const NeighborBondArray& neighborArray, int neighborIndex, unsigned int& commonNeighbors, int numNeighbors)
+{
+	commonNeighbors = neighborArray.neighborArray[neighborIndex];
+#ifndef Q_CC_MSVC
+	// Count the number of bits set in neighbor bit-field.
+	return __builtin_popcount(commonNeighbors);
+#else
+	// Count the number of bits set in neighbor bit-field.
+	unsigned int v = commonNeighbors - ((commonNeighbors >> 1) & 0x55555555);
+	v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
+	return ((v + (v >> 4) & 0xF0F0F0F) * 0x1010101) >> 24;
+#endif
+}
+
+/******************************************************************************
+* Finds all bonds between common nearest neighbors.
+******************************************************************************/
+int findNeighborBonds(const NeighborBondArray& neighborArray, unsigned int commonNeighbors, int numNeighbors, CNAPairBond* neighborBonds)
+{
+	int numBonds = 0;
+
+	unsigned int nib[32];
+	int nibn = 0;
+	unsigned int ni1b = 1;
+	for(int ni1 = 0; ni1 < numNeighbors; ni1++, ni1b <<= 1) {
+		if(commonNeighbors & ni1b) {
+			unsigned int b = commonNeighbors & neighborArray.neighborArray[ni1];
+			for(int n = 0; n < nibn; n++) {
+				if(b & nib[n]) {
+					neighborBonds[numBonds++] = ni1b | nib[n];
+				}
+			}
+			nib[nibn++] = ni1b;
+		}
+	}
+	return numBonds;
+}
+
+/******************************************************************************
+* Find all chains of bonds.
+******************************************************************************/
+static int getAdjacentBonds(unsigned int atom, CNAPairBond* bondsToProcess, int& numBonds, unsigned int& atomsToProcess, unsigned int& atomsProcessed)
+{
+    int adjacentBonds = 0;
+	for(int b = numBonds - 1; b >= 0; b--) {
+		if(atom & *bondsToProcess) {
+            ++adjacentBonds;
+   			atomsToProcess |= *bondsToProcess & (~atomsProcessed);
+   			memmove(bondsToProcess, bondsToProcess + 1, sizeof(CNAPairBond) * b);
+   			numBonds--;
+		}
+		else ++bondsToProcess;
+	}
+	return adjacentBonds;
+}
+
+/******************************************************************************
+* Find all chains of bonds between common neighbors and determine the length
+* of the longest continuous chain.
+******************************************************************************/
+int calcMaxChainLength(CNAPairBond* neighborBonds, int numBonds)
+{
+    // Group the common bonds into clusters.
+	int maxChainLength = 0;
+	while(numBonds) {
+        // Make a new cluster starting with the first remaining bond to be processed.
+		numBonds--;
+        unsigned int atomsToProcess = neighborBonds[numBonds];
+        unsigned int atomsProcessed = 0;
+		int clusterSize = 1;
+        do {
+#ifndef Q_CC_MSVC
+        	// Determine the number of trailing 0-bits in atomsToProcess, starting at the least significant bit position.
+			int nextAtomIndex = __builtin_ctz(atomsToProcess);
+#else
+			unsigned long nextAtomIndex;
+			_BitScanForward(&nextAtomIndex, atomsToProcess);
+			assert(nextAtomIndex >= 0 && nextAtomIndex < 32);
+#endif
+			unsigned int nextAtom = 1 << nextAtomIndex;
+        	atomsProcessed |= nextAtom;
+			atomsToProcess &= ~nextAtom;
+			clusterSize += getAdjacentBonds(nextAtom, neighborBonds, numBonds, atomsToProcess, atomsProcessed);
+		}
+        while(atomsToProcess);
+        if(clusterSize > maxChainLength)
+        	maxChainLength = clusterSize;
+	}
+	return maxChainLength;
+}
+
+int analyzeSmallSignature(NeighborBondArray& neighborArray)
+{
+	int nn = 12;
+	int n421 = 0;
+	int n422 = 0;
+	int n555 = 0;
+	for(int ni = 0; ni < nn; ni++) {
+
+		// Determine number of neighbors the two atoms have in common.
+		unsigned int commonNeighbors;
+		int numCommonNeighbors = findCommonNeighbors(neighborArray, ni, commonNeighbors, nn);
+		if(numCommonNeighbors != 4 && numCommonNeighbors != 5)
+			break;
+
+		// Determine the number of bonds among the common neighbors.
+		CNAPairBond neighborBonds[MAX_NEIGHBORS*MAX_NEIGHBORS];
+		int numNeighborBonds = findNeighborBonds(neighborArray, commonNeighbors, nn, neighborBonds);
+		if(numNeighborBonds != 2 && numNeighborBonds != 5)
+			break;
+
+		// Determine the number of bonds in the longest continuous chain.
+		int maxChainLength = calcMaxChainLength(neighborBonds, numNeighborBonds);
+		if(numCommonNeighbors == 4 && numNeighborBonds == 2) {
+			if(maxChainLength == 1) n421++;
+			else if(maxChainLength == 2) n422++;
+			else break;
+		}
+		else if(numCommonNeighbors == 5 && numNeighborBonds == 5 && maxChainLength == 5) n555++;
+		else break;
+	}
+	if(n421 == 12) return FCC;
+	else if(n421 == 6 && n422 == 6) return HCP;
+	else if(n555 == 12) return ICOS;
+	return OTHER;
+}
+
+int analyzeLargeSignature(NeighborBondArray& neighborArray)
+{
+	int nn = 14;
+	int n444 = 0;
+	int n666 = 0;
+	for(int ni = 0; ni < nn; ni++) {
+
+		// Determine number of neighbors the two atoms have in common.
+		unsigned int commonNeighbors;
+		int numCommonNeighbors = findCommonNeighbors(neighborArray, ni, commonNeighbors, nn);
+		if(numCommonNeighbors != 4 && numCommonNeighbors != 6)
+			break;
+
+		// Determine the number of bonds among the common neighbors.
+		CNAPairBond neighborBonds[MAX_NEIGHBORS*MAX_NEIGHBORS];
+		int numNeighborBonds = findNeighborBonds(neighborArray, commonNeighbors, nn, neighborBonds);
+		if(numNeighborBonds != 4 && numNeighborBonds != 6)
+			break;
+
+		// Determine the number of bonds in the longest continuous chain.
+		int maxChainLength = calcMaxChainLength(neighborBonds, numNeighborBonds);
+		if(numCommonNeighbors == 4 && numNeighborBonds == 4 && maxChainLength == 4) n444++;
+		else if(numCommonNeighbors == 6 && numNeighborBonds == 6 && maxChainLength == 6) n666++;
+		else break;
+	}
+	if(n666 == 8 && n444 == 6) return BCC;
+	return OTHER;
+}
+
+
+typedef struct {
+  int index;
+  double d;
+} nbr_t;
+
+static bool sorthelper_compare(nbr_t const &a, nbr_t const &b) {
+  return a.d < b.d;
 }
 
 static double squared_distance(double* a, double* b)
@@ -141,14 +323,14 @@ static double squared_distance(double* a, double* b)
 }
 
 static int get_neighbours(int *numneigh, int **firstneigh, double **x,
-                          size_t atom_index, int num, double (*nbr_pos)[3])
+                          size_t atom_index, int num, double (*nbr_pos)[3], double* lengths)
 {
   double *pos = x[atom_index];
 
   int *jlist = NULL;
   int jnum = 0;
-  jlist = data->firstneigh[atom_index];
-  jnum = data->numneigh[atom_index];
+  jlist = firstneigh[atom_index];
+  jnum = numneigh[atom_index];
 
   std::vector<nbr_t> nbr_order;
   for (int jj = 0; jj < jnum; jj++) {
@@ -157,7 +339,7 @@ static int get_neighbours(int *numneigh, int **firstneigh, double **x,
     if (j == atom_index)
       continue;
 
-    nbr_t nbr = {j, square_distanced(pos, x[j])};
+    nbr_t nbr = {j, squared_distance(pos, x[j])};
     nbr_order.push_back(nbr);
   }
 
@@ -169,214 +351,270 @@ static int get_neighbours(int *numneigh, int **firstneigh, double **x,
     nbr_pos[jj][0] = x[j][0] - pos[0];
     nbr_pos[jj][1] = x[j][1] - pos[1];
     nbr_pos[jj][2] = x[j][2] - pos[2];
+
+    lengths[jj] = nbr_order[jj].d;
   }
 
   return num_nbrs;
 }
 
+enum GraphEdgeType {
+  NONE,
+  SHORT,
+  LONG
+};
+
+struct GraphEdge {
+  GraphEdge(int _i, int _j, double _length, int _edgeType)
+    : i(_i), j(_j), length(_length), edgeType(_edgeType) {}
+
+  int i = 0;
+  int j = 0;
+  double length = 0;
+  int edgeType = 0;
+  GraphEdge* nextShort = NULL;
+  GraphEdge* nextLong = NULL;
+};
+
+/******************************************************************************
+* Builds an edge list sorted by length
+******************************************************************************/
+class EdgeIterator {
+public:
+  EdgeIterator(int nn, double (*neighborVectors)[3], double shortThreshold, double longThreshold) {
+
+    if (nn < 12) shortThreshold = 0;
+    if (nn < 14) longThreshold = 0;
+
+    // End points are the shortest edges lengths which exceed their respective thresholds.
+    GraphEdge shortEnd(-1, -1, INFINITY, SHORT);
+    GraphEdge longEnd(-1, -1, INFINITY, LONG);
+
+    // Find edges which will make up intervals.
+    for (int i=0;i<nn;i++) {
+      for (int j=i+1;j<nn;j++) {
+        double length = sqrt(squared_distance(neighborVectors[i], neighborVectors[j]));
+
+        int edgeType = NONE;
+        if (i < 12 && j < 12 && length < shortThreshold) {
+          edgeType |= SHORT;
+        }
+        if (length < longThreshold) {
+          edgeType |= LONG;
+        }
+
+        if (edgeType == NONE) {
+          if (length < longEnd.length) {
+            longEnd = GraphEdge(i, j, length, LONG);
+          }
+          else if (length < shortEnd.length) {
+            shortEnd = GraphEdge(i, j, length, SHORT);
+          }
+        }
+        else {
+          edges.push_back(GraphEdge(i, j, length, edgeType));
+        }
+      }
+    }
+
+    // Sort edges by length to create intervals.
+    std::sort(edges.begin(), edges.end(), &edge_compare);
+
+    if (shortEnd.i != -1) {
+      edges.push_back(shortEnd);
+    }
+    if (longEnd.i != -1) {
+      edges.push_back(longEnd);
+    }
+
+    // Create two paths through intervals: short and long.
+    for (int i=edges.size() - 1;i>=0;i--) {
+      if (edges[i].edgeType & SHORT) {
+        edges[i].nextShort = nextShort;
+        nextShort = &edges[i];
+      }
+      if (edges[i].edgeType & LONG) {
+        edges[i].nextLong = nextLong;
+        nextLong = &edges[i];
+      }
+    }
+  }
+
+  static bool edge_compare(GraphEdge const &a, GraphEdge const &b) {
+    return a.length < b.length;
+  }
+
+  std::vector< GraphEdge > edges;
+  GraphEdge* nextLong = NULL;
+  GraphEdge* nextShort = NULL;
+};
+
+static int analyze_atom(int *numneigh, int **firstneigh, double **positions,
+                          size_t atom_index)
+{
+	// Find nearest neighbors of current atom.
+    #define ICNA_MAX_NBRS 17
+    double nbrs[ICNA_MAX_NBRS][3];
+    double neighborLengths[ICNA_MAX_NBRS];
+    int num_found = get_neighbours(numneigh, firstneigh, positions, atom_index,
+                                   ICNA_MAX_NBRS, nbrs, neighborLengths);
+
+	// Determine which structure types to search for.
+	bool analyzeShort = num_found >= 12;
+	bool analyzeLong = num_found >= 14;
+	if (analyzeLong) num_found = 14;
+	else if (analyzeShort) num_found = 12;
+	else return OTHER;
+
+	// We will set the threshold for interval start points two thirds of the way between
+	// the first and second neighbor shells.
+	const double x = 2.0f / 3.0f;
+	const double fraction = ((1 - x) * 1 + x * sqrt(2));
+
+	// Calculate length thresholds and local scaling factors.
+	double shortLengthThreshold = 0, longLengthThreshold = 0;
+
+	if (analyzeShort) {
+		int num = 12;
+		double shortLocalScaling = 0;
+		for(int i = 0; i < num; i++)
+			shortLocalScaling += neighborLengths[i];
+		shortLocalScaling /= num;
+		shortLengthThreshold = fraction * shortLocalScaling;
+	}
+	if (analyzeLong) {
+		int num = 14;
+		double longLocalScaling = 0;
+		for(int i = 0; i < 8; i++)
+			longLocalScaling += neighborLengths[i] / sqrt(3.0f / 4.0f);
+		for(int i = 8; i < num; i++)
+			longLocalScaling += neighborLengths[i];
+		longLocalScaling /= num;
+		longLengthThreshold = fraction * longLocalScaling;
+	}
+
+	// Use interval width to resolve ambiguities in traditional CNA classification
+	double bestIntervalWidth = 0;
+	int bestType = OTHER;
+
+	EdgeIterator it = EdgeIterator(num_found, nbrs, shortLengthThreshold, longLengthThreshold);
+
+	/////////// 12 neighbors ///////////
+	if(analyzeShort) {
+		const int num = 12; //Number of neighbors to analyze for FCC, HCP and Icosahedral atoms
+		int n4 = 0, n5 = 0;
+		int coordinations[num] = {0};
+		NeighborBondArray neighborArray;
+
+		GraphEdge* edge = it.nextShort;
+		GraphEdge* next = edge != NULL ? edge->nextShort : NULL;
+		while (next != NULL) {
+			coordinations[edge->i]++;
+			coordinations[edge->j]++;
+			neighborArray.setNeighborBond(edge->i, edge->j, true);
+
+			if (coordinations[edge->i] == 4) n4++;
+			if (coordinations[edge->i] == 5) {n4--; n5++;}
+			if (coordinations[edge->i] > 5) break;
+
+			if (coordinations[edge->j] == 4) n4++;
+			if (coordinations[edge->j] == 5) {n4--; n5++;}
+			if (coordinations[edge->j] > 5) break;
+
+			if (n4 == num || n5 == num) {
+				// Coordination numbers are correct - perform traditional CNA
+				int type = analyzeSmallSignature(neighborArray);
+				if (type != OTHER) {
+					double intervalWidth = next->length - edge->length;
+					if (intervalWidth > bestIntervalWidth) {
+						bestIntervalWidth = intervalWidth;
+						bestType = type;
+					}
+				}
+			}
+
+			edge = next;
+			next = next->nextShort;
+		}
+	}
+
+	/////////// 14 neighbors ///////////
+	if(analyzeLong) {
+		const int num = 14; //Number of neighbors to analyze for BCC atoms
+		int n4 = 0, n6 = 0;
+		int coordinations[num] = {0};
+		NeighborBondArray neighborArray;
+
+		GraphEdge* edge = it.nextLong;
+		GraphEdge* next = edge != NULL ? edge->nextLong : NULL;
+		while (next != NULL) {
+			coordinations[edge->i]++;
+			coordinations[edge->j]++;
+			neighborArray.setNeighborBond(edge->i, edge->j, true);
+
+			if (coordinations[edge->i] == 4) n4++;
+			if (coordinations[edge->i] == 5) n4--;
+			if (coordinations[edge->i] == 6) n6++;
+			if (coordinations[edge->i] > 6) break;
+
+			if (coordinations[edge->j] == 4) n4++;
+			if (coordinations[edge->j] == 5) n4--;
+			if (coordinations[edge->j] == 6) n6++;
+			if (coordinations[edge->j] > 6) break;
+
+			if (n4 == 6 && n6 == 8) {
+				// Coordination numbers are correct - perform traditional CNA
+				int type = analyzeLargeSignature(neighborArray);
+				if (type != OTHER) {
+					double intervalWidth = next->length - edge->length;
+					if (intervalWidth > bestIntervalWidth) {
+						bestIntervalWidth = intervalWidth;
+						bestType = type;
+					}
+				}
+			}
+
+			edge = next;
+			next = next->nextLong;
+		}
+	}
+
+	return bestType;
+}
+
 void ComputeICNAAtom::compute_peratom()
 {
-  int i,j,k,ii,jj,kk,m,n,inum,jnum,inear,jnear;
-  int firstflag,ncommon,nbonds,maxbonds,minbonds;
-  int nfcc,nhcp,nbcc4,nbcc6,nico,cj,ck,cl,cm;
-  int *ilist,*jlist,*numneigh,**firstneigh;
-  int icna[MAXNEAR][4],onenearest[MAXNEAR];
-  int common[MAXCOMMON],bonds[MAXCOMMON];
-  double xtmp,ytmp,ztmp,delx,dely,delz,rsq;
-
   invoked_peratom = update->ntimestep;
 
   // grow arrays if necessary
-
   if (atom->nmax > nmax) {
-    //memory->destroy(nearest);
-    //memory->destroy(nnearest);
     memory->destroy(pattern);
     nmax = atom->nmax;
-
-    //memory->create(nearest,nmax,MAXNEAR,"icna:nearest");
-    //memory->create(nnearest,nmax,"icna:nnearest");
     memory->create(pattern,nmax,"icna:icna_pattern");
     vector_atom = pattern;
   }
 
   // invoke full neighbor list (will copy or build if necessary)
-
   neighbor->build_one(list);
 
-  inum = list->inum;
-  ilist = list->ilist;
-  numneigh = list->numneigh;
-  firstneigh = list->firstneigh;
-
-  // find the neigbours of each atom within cutoff using full neighbor list
-  // nearest[] = atom indices of nearest neighbors, up to MAXNEAR
-  // do this for all atoms, not just compute group
-  // since ICNA calculation requires neighbors of neighbors
-
+  int inum = list->inum;
+  int *ilist = list->ilist;
+  int *numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
   double **x = atom->x;
   int *mask = atom->mask;
   int nlocal = atom->nlocal;
 
   // compute ICNA for each atom in group
-  // only performed if # of nearest neighbors = 12 or 14 (fcc,hcp)
-
   int nerror = 0;
-  for (ii = 0; ii < inum; ii++) {
+  for (int ii = 0; ii < inum; ii++) {
     int atom_index = ilist[ii];
 
     if (!(mask[atom_index] & groupbit)) {
       pattern[atom_index] = UNKNOWN;
-      continue;
     }
-
-    #define ICNA_MAX_NBRS 17
-    pattern[atom_index] = OTHER;
-    double nbrs[ICNA_MAX_NBRS][3];
-    int num_found = get_neighbours(numneigh, firstneigh, x, atom_index, ICNA_MAX_NBRS, nbrs);
-    if (num_found < 12) {
-        continue;
-    }
-
-    double distances[ICNA_MAX_NBRS][ICNA_MAX_NBRS];
-    for (int j=0;j<num_found;j++) {
-        distances[j][j] = INFINITY;
-        for (int i=j+1;i<num_found;i++) {
-            distances[i, j] = squared_distance(nbrs[i], nbrs[j]);
-        }
-    }
-
-    // loop over near neighbors of I to build icna data structure
-    // icna[k][NCOMMON] = # of common neighbors of I with each of its neighs
-    // icna[k][NBONDS] = # of bonds between those common neighbors
-    // icna[k][MAXBOND] = max # of bonds of any common neighbor
-    // icna[k][MINBOND] = min # of bonds of any common neighbor
-
-    for (m = 0; m < nnearest[i]; m++) {
-      j = nearest[i][m];
-
-      // common = list of neighbors common to atom I and atom J
-      // if J is an owned atom, use its near neighbor list to find them
-      // if J is a ghost atom, use full neighbor list of I to find them
-      // in latter case, must exclude J from I's neighbor list
-
-      if (j < nlocal) {
-        firstflag = 1;
-        ncommon = 0;
-        for (inear = 0; inear < nnearest[i]; inear++)
-          for (jnear = 0; jnear < nnearest[j]; jnear++)
-            if (nearest[i][inear] == nearest[j][jnear]) {
-              if (ncommon < MAXCOMMON) common[ncommon++] = nearest[i][inear];
-              else if (firstflag) {
-                nerror++;
-                firstflag = 0;
-              }
-            }
-
-      } else {
-        xtmp = x[j][0];
-        ytmp = x[j][1];
-        ztmp = x[j][2];
-        jlist = firstneigh[i];
-        jnum = numneigh[i];
-
-        n = 0;
-        for (kk = 0; kk < jnum; kk++) {
-          k = jlist[kk];
-          k &= NEIGHMASK;
-          if (k == j) continue;
-
-          delx = xtmp - x[k][0];
-          dely = ytmp - x[k][1];
-          delz = ztmp - x[k][2];
-          rsq = delx*delx + dely*dely + delz*delz;
-          if (rsq < cutsq) {
-            if (n < MAXNEAR) onenearest[n++] = k;
-            else break;
-          }
-        }
-
-        firstflag = 1;
-        ncommon = 0;
-        for (inear = 0; inear < nnearest[i]; inear++)
-          for (jnear = 0; (jnear < n) && (n < MAXNEAR); jnear++)
-            if (nearest[i][inear] == onenearest[jnear]) {
-              if (ncommon < MAXCOMMON) common[ncommon++] = nearest[i][inear];
-              else if (firstflag) {
-                nerror++;
-                firstflag = 0;
-              }
-            }
-      }
-
-      icna[m][NCOMMON] = ncommon;
-
-      // calculate total # of bonds between common neighbor atoms
-      // also max and min # of common atoms any common atom is bonded to
-      // bond = pair of atoms within cutoff
-
-      for (n = 0; n < ncommon; n++) bonds[n] = 0;
-
-      nbonds = 0;
-      for (jj = 0; jj < ncommon-1; jj++) {
-        j = common[jj];
-        xtmp = x[j][0];
-        ytmp = x[j][1];
-        ztmp = x[j][2];
-        for (kk = jj+1; kk < ncommon; kk++) {
-          k = common[kk];
-          delx = xtmp - x[k][0];
-          dely = ytmp - x[k][1];
-          delz = ztmp - x[k][2];
-          rsq = delx*delx + dely*dely + delz*delz;
-          if (rsq < cutsq) {
-            nbonds++;
-            bonds[jj]++;
-            bonds[kk]++;
-          }
-        }
-      }
-
-      icna[m][NBOND] = nbonds;
-
-      maxbonds = 0;
-      minbonds = MAXCOMMON;
-      for (n = 0; n < ncommon; n++) {
-        maxbonds = MAX(bonds[n],maxbonds);
-        minbonds = MIN(bonds[n],minbonds);
-      }
-      icna[m][MAXBOND] = maxbonds;
-      icna[m][MINBOND] = minbonds;
-    }
-
-    // detect ICNA pattern of the atom
-    pattern[i] = OTHER;
-    nfcc = nhcp = nbcc4 = nbcc6 = nico = 0;
-
-    if (nnearest[i] == 12) {
-      for (inear = 0; inear < 12; inear++) {
-        cj = icna[inear][NCOMMON];
-        ck = icna[inear][NBOND];
-        cl = icna[inear][MAXBOND];
-        cm = icna[inear][MINBOND];
-        if (cj == 4 && ck == 2 && cl == 1 && cm == 1) nfcc++;
-        else if (cj == 4 && ck == 2 && cl == 2 && cm == 0) nhcp++;
-        else if (cj == 5 && ck == 5 && cl == 2 && cm == 2) nico++;
-      }
-      if (nfcc == 12) pattern[i] = FCC;
-      else if (nfcc == 6 && nhcp == 6) pattern[i] = HCP;
-      else if (nico == 12) pattern[i] = ICOS;
-
-    } else if (nnearest[i] == 14) {
-      for (inear = 0; inear < 14; inear++) {
-        cj = icna[inear][NCOMMON];
-        ck = icna[inear][NBOND];
-        cl = icna[inear][MAXBOND];
-        cm = icna[inear][MINBOND];
-        if (cj == 4 && ck == 4 && cl == 2 && cm == 2) nbcc4++;
-        else if (cj == 6 && ck == 6 && cl == 2 && cm == 2) nbcc6++;
-      }
-      if (nbcc4 == 6 && nbcc6 == 8) pattern[i] = BCC;
+    else {
+      pattern[atom_index] = analyze_atom(numneigh, firstneigh, x, atom_index);
     }
   }
 }
@@ -388,7 +626,7 @@ void ComputeICNAAtom::compute_peratom()
 double ComputeICNAAtom::memory_usage()
 {
   double bytes = nmax * sizeof(int);
-  bytes += nmax * MAXNEAR * sizeof(int);
   bytes += nmax * sizeof(double);
   return bytes;
 }
+
